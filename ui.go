@@ -4,8 +4,11 @@ package main
 // component library.
 
 import (
+	"embed"
 	"fmt"
 	"os"
+	"os/exec"
+	"text/template"
 	"time"
 
 	"github.com/charmbracelet/bubbles/list"
@@ -25,9 +28,9 @@ type model struct {
 	semverList          list.Model
 	createScripts       bool
 	textInput           textinput.Model
-	showPodInput        bool
+	showPlistInput      bool
 	showGradleInput     bool
-	podFileLocation     string
+	infoPlistLocation   string
 	buildGradleLocation string
 }
 
@@ -168,19 +171,56 @@ func startVersionCheck() tea.Msg {
 	return AppStateMsg(ShowSemverSelect)
 }
 
-func createScripts() tea.Msg {
-	// write to disk
-	pause()
-	return AppStateMsg(CreatedScripts)
+type ScriptInput struct {
+	InfoPlistLocation   string
+	BuildGradleLocation string
 }
 
-func startSemverIncrement() tea.Msg {
-	// increase semver using `npm`
-	return AppStateMsg(SemVerIncreased)
+//go:embed templates/*.sh
+var embedFS embed.FS
+
+func createScriptFiles(m model) tea.Cmd {
+	return func() tea.Msg {
+		scriptOutput, err := os.Create(CONFIG_FOLDER + "/" + SCRIPT_FILE_NAME)
+		bail(err)
+
+		scriptOutput.Chmod(os.ModePerm)
+
+		parsedTemplates, err := template.ParseFS(embedFS, "templates/*.sh")
+		bail(err)
+		defer scriptOutput.Close()
+
+		err = parsedTemplates.ExecuteTemplate(scriptOutput, "syncVersionShell",
+			ScriptInput{
+
+				InfoPlistLocation:   m.infoPlistLocation,
+				BuildGradleLocation: m.buildGradleLocation,
+			})
+
+		bail(err)
+
+		pause()
+		return AppStateMsg(CreatedScripts)
+	}
+}
+
+func startSemverIncrement(m model) tea.Cmd {
+	return func() tea.Msg {
+		// increase semver using `npm`
+		cmd := exec.Command("npm", "version", m.selectedSemver)
+		_, err := cmd.Output()
+		// TODO: use the stdout to figure out the version
+		// increased as intended
+		bail(err)
+		return AppStateMsg(SemVerIncreased)
+	}
 }
 
 func syncWithPlatform() tea.Msg {
 	// run the generated script
+	cmd := exec.Command("./" + CONFIG_FOLDER + "/" + SCRIPT_FILE_NAME)
+	_, err := cmd.Output()
+	bail(err)
 	pause()
 	return AppStateMsg(Done)
 }
@@ -206,10 +246,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tea.Quit
 		case "enter":
 
-			if m.createScripts && m.showPodInput {
-				m.podFileLocation = m.textInput.Value()
+			if m.createScripts && m.showPlistInput {
+				m.infoPlistLocation = m.textInput.Value()
 				m.textInput.SetValue("")
-				m.showPodInput = false
+				m.showPlistInput = false
 				return m, getGradleFileLocation
 			}
 
@@ -224,7 +264,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				i, ok := m.semverList.SelectedItem().(item)
 				if ok {
 					m.selectedSemver = string(i)
-					return m, startSemverIncrement
+					return m, startSemverIncrement(m)
 				}
 			}
 
@@ -255,18 +295,21 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case AppStateMsg(CheckFiles):
 			m.processName = "Looking for existing files"
 			return m, checkExistingFiles
+		case AppStateMsg(FilesChecked):
+			m.processName = "Looking for versioning data"
+			return m, startVersionCheck
 		case AppStateMsg(FilesNotFound):
 			m.createScripts = true
 			return m, getPodFileLocation
 		case AppStateMsg(GetPodFile):
-			m.showPodInput = true
+			m.showPlistInput = true
 			return m, nil
 		case AppStateMsg(GetGradleFile):
 			m.showGradleInput = true
 			return m, nil
 		case AppStateMsg(CreateScripts):
 			m.processName = "Creating Scripts"
-			return m, createScripts
+			return m, createScriptFiles(m)
 		case AppStateMsg(CreatedScripts):
 			m.createScripts = false
 			m.processName = "Looking for versioning data"
@@ -295,8 +338,8 @@ func (m model) View() string {
 	}
 
 	if m.createScripts {
-		if m.showPodInput {
-			return fmt.Sprintf("\n   %s\n%s \n", getTextStyle().Render("Location of your Podfile"), m.textInput.View())
+		if m.showPlistInput {
+			return fmt.Sprintf("\n   %s\n%s \n", getTextStyle().Render("Location of your Info.plist"), m.textInput.View())
 
 		}
 		if m.showGradleInput {
