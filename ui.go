@@ -5,7 +5,9 @@ package main
 
 import (
 	"embed"
+	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"os/exec"
 	"text/template"
@@ -16,6 +18,7 @@ import (
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/coreos/go-semver/semver"
 )
 
 type model struct {
@@ -32,17 +35,25 @@ type model struct {
 	showGradleInput     bool
 	infoPlistLocation   string
 	buildGradleLocation string
+	version             string
 }
 
 type AppState int64
 
 type AppStateMsg AppState
 
-type item string
+type version struct {
+	title       string
+	description string
+}
 
-func (i item) Title() string       { return string(i) }
-func (i item) Description() string { return "" }
-func (i item) FilterValue() string { return string(i) }
+type PackageJSON struct {
+	Version string
+}
+
+func (i version) Title() string       { return i.title }
+func (i version) Description() string { return i.description }
+func (i version) FilterValue() string { return i.title }
 
 var listStyle = lipgloss.NewStyle().Margin(1, 2)
 
@@ -67,10 +78,16 @@ const (
 const CONFIG_FOLDER = ".rnrelease"
 const SCRIPT_FILE_NAME = "sync_version.sh"
 
+var VERSIONING_FILES = []string{
+	"package.json",
+}
+
 var SEMVER_COMMANDS = []string{
 	"patch",
 	"minor",
 	"major",
+	// TODO: re add them when you have better semver library that supports
+	// bumping prerelease version, if not, then make one
 	"prepatch",
 	"preminor",
 	"premajor",
@@ -120,15 +137,28 @@ func initialModel() model {
 	ti := createInput()
 	s := createSpinner()
 
-	items := []list.Item{}
+	return model{spinner: s, textInput: ti}
+}
 
+func getVersionItems() []version {
+	items := []version{}
 	for _, x := range SEMVER_COMMANDS {
-		items = append(items, item(x))
+		items = append(items, version{
+			title: x,
+		})
 	}
+	return items
+}
 
-	l := createList(items)
-
-	return model{spinner: s, semverList: l, textInput: ti}
+func versionToListItem(items []version) []list.Item {
+	listItems := []list.Item{}
+	for _, x := range items {
+		listItems = append(listItems, version{
+			title:       x.title,
+			description: x.description,
+		})
+	}
+	return listItems
 }
 
 func appInit() tea.Msg {
@@ -166,9 +196,34 @@ func startCreatingScript() tea.Msg {
 	return AppStateMsg(CreateScripts)
 }
 
-func startVersionCheck() tea.Msg {
+func startVersionCheck(m model) (model, tea.Cmd) {
+	var fileFound string
+	for _, fileName := range VERSIONING_FILES {
+		if _, err := os.Stat(fileName); err == nil {
+			fileFound = fileName
+		}
+	}
+
+	if fileFound == "" {
+		verFileError := fmt.Errorf("no versioning file found, please add one of the following %v", VERSIONING_FILES)
+		log.Fatal(verFileError)
+		bail(verFileError)
+	}
+
+	switch fileFound {
+	case "package.json":
+		var buf PackageJSON
+		fileData, err := os.ReadFile(fileFound)
+		bail(err)
+		bail(json.Unmarshal(fileData, &buf))
+		m.version = buf.Version
+	}
+
 	pause()
-	return AppStateMsg(ShowSemverSelect)
+	cmd := func() tea.Msg {
+		return AppStateMsg(ShowSemverSelect)
+	}
+	return m, cmd
 }
 
 type ScriptInput struct {
@@ -233,6 +288,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 
 	case tea.WindowSizeMsg:
+		if !m.showSemver {
+			return m, nil
+		}
 		top, right, bottom, left := listStyle.GetMargin()
 		m.semverList.SetSize(msg.Width-left-right, msg.Height-top-bottom)
 		var cmd tea.Cmd
@@ -261,9 +319,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 
 			if m.showSemver {
-				i, ok := m.semverList.SelectedItem().(item)
+				i, ok := m.semverList.SelectedItem().(version)
 				if ok {
-					m.selectedSemver = string(i)
+					m.selectedSemver = string(i.title)
 					return m, startSemverIncrement(m)
 				}
 			}
@@ -297,7 +355,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, checkExistingFiles
 		case AppStateMsg(FilesChecked):
 			m.processName = "Looking for versioning data"
-			return m, startVersionCheck
+			m, cmd := startVersionCheck(m)
+			return m, cmd
 		case AppStateMsg(FilesNotFound):
 			m.createScripts = true
 			return m, getPodFileLocation
@@ -313,9 +372,39 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case AppStateMsg(CreatedScripts):
 			m.createScripts = false
 			m.processName = "Looking for versioning data"
-			return m, startVersionCheck
+			m, cmd := startVersionCheck(m)
+			return m, cmd
 		case AppStateMsg(ShowSemverSelect):
 			m.showSemver = true
+			versionItems := getVersionItems()
+			// FIXME: change to a pointer to remove the
+			// un-needed array below
+			var modifedSet []version
+
+			for _, versionItem := range versionItems {
+				currentVersion := semver.New(m.version)
+				switch versionItem.title {
+				case "patch":
+					patchV := semver.New(currentVersion.String())
+					patchV.BumpPatch()
+					newVer := (patchV.String())
+					versionItem.description = newVer
+				case "minor":
+					minorV := semver.New(currentVersion.String())
+					minorV.BumpMinor()
+					versionItem.description = minorV.String()
+				case "major":
+					majorV := semver.New(currentVersion.String())
+					majorV.BumpMajor()
+					versionItem.description = majorV.String()
+				default:
+					versionItem.description = "Unable to predict"
+				}
+				modifedSet = append(modifedSet, versionItem)
+			}
+
+			l := createList(versionToListItem(modifedSet))
+			m.semverList = l
 			return m, nil
 		case AppStateMsg(SemVerIncreased):
 			m.showSemver = false
