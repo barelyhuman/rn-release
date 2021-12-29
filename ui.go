@@ -4,6 +4,7 @@ package main
 // component library.
 
 import (
+	"bytes"
 	"embed"
 	"encoding/json"
 	"fmt"
@@ -121,17 +122,6 @@ func createSpinner() spinner.Model {
 	return s
 }
 
-func createList(items []list.Item) list.Model {
-	l := list.NewModel(items, list.NewDefaultDelegate(), 0, 0)
-	l.Title = "What semver increment do you want to do?"
-	l.SetShowStatusBar(false)
-	l.SetFilteringEnabled(false)
-	l.Styles.Title = getTextStyle()
-	l.Styles.PaginationStyle = getTextStyle()
-	l.Styles.HelpStyle = getTextStyle()
-	return l
-}
-
 func initialModel() model {
 
 	ti := createInput()
@@ -152,11 +142,8 @@ func getVersionItems() []version {
 
 func versionToListItem(items []version) []list.Item {
 	listItems := []list.Item{}
-	for _, x := range items {
-		listItems = append(listItems, version{
-			title:       x.title,
-			description: x.description,
-		})
+	for _, itemRef := range items {
+		listItems = append(listItems, itemRef)
 	}
 	return listItems
 }
@@ -263,10 +250,18 @@ func startSemverIncrement(m model) tea.Cmd {
 	return func() tea.Msg {
 		// increase semver using `npm`
 		cmd := exec.Command("npm", "version", m.selectedSemver)
-		_, err := cmd.Output()
 		// TODO: use the stdout to figure out the version
 		// increased as intended
-		bail(err)
+		var out bytes.Buffer
+		var stderr bytes.Buffer
+		cmd.Stdout = &out
+		cmd.Stderr = &stderr
+
+		err := cmd.Run()
+
+		if err != nil {
+			log.Fatalf(stderr.String())
+		}
 		return AppStateMsg(SemVerIncreased)
 	}
 }
@@ -330,8 +325,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			var cmds []tea.Cmd
 			var c tea.Cmd
 
-			m.semverList, c = m.semverList.Update(msg)
-			cmds = append(cmds, c)
+			if m.showSemver {
+				m.semverList, c = m.semverList.Update(msg)
+				cmds = append(cmds, c)
+			}
 
 			m.textInput, c = m.textInput.Update(msg)
 			cmds = append(cmds, c)
@@ -351,7 +348,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.processName = "Initialized"
 			return m, startFileCheck
 		case AppStateMsg(CheckFiles):
-			m.processName = "Looking for existing files"
+			m.processName = "Check if script exists"
 			return m, checkExistingFiles
 		case AppStateMsg(FilesChecked):
 			m.processName = "Looking for versioning data"
@@ -377,38 +374,34 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case AppStateMsg(ShowSemverSelect):
 			m.showSemver = true
 			versionItems := getVersionItems()
-			// FIXME: change to a pointer to remove the
-			// un-needed array below
-			var modifedSet []version
 
-			for _, versionItem := range versionItems {
+			for i, versionItem := range versionItems {
 				currentVersion := semver.New(m.version)
 				switch versionItem.title {
 				case "patch":
 					patchV := semver.New(currentVersion.String())
 					patchV.BumpPatch()
 					newVer := (patchV.String())
-					versionItem.description = newVer
+					versionItems[i].description = newVer
 				case "minor":
 					minorV := semver.New(currentVersion.String())
 					minorV.BumpMinor()
-					versionItem.description = minorV.String()
+					versionItems[i].description = minorV.String()
 				case "major":
 					majorV := semver.New(currentVersion.String())
 					majorV.BumpMajor()
-					versionItem.description = majorV.String()
+					versionItems[i].description = majorV.String()
 				default:
-					versionItem.description = "Unable to predict"
+					versionItems[i].description = "Couldn't Predict"
 				}
-				modifedSet = append(modifedSet, versionItem)
 			}
 
-			l := createList(versionToListItem(modifedSet))
+			l := createList(versionToListItem(versionItems))
 			m.semverList = l
 			return m, nil
 		case AppStateMsg(SemVerIncreased):
 			m.showSemver = false
-			m.processName = "Syncing versions with platform files"
+			m.processName = "Syncing version with platform files"
 			return m, syncWithPlatform
 		case AppStateMsg(Done):
 			return m, tea.Quit
